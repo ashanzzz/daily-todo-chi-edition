@@ -1,0 +1,8 @@
+{
+  "name": "Daily Todo",
+  "short_name": "Todo",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#f6f7fb",
+  "theme_color": "#6f6cf4"
+}

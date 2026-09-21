@@ -1,0 +1,13 @@
+# Operating-system and editor files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Local tooling and temporary files
+.vscode/
+.idea/
+*.log
+*.tmp
+
+# Exported task backups (keep personal backups outside the source repository)
+daily-todo-backup-*.json
