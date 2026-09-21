@@ -11,3 +11,8 @@ Desktop.ini
 
 # Exported task backups (keep personal backups outside the source repository)
 daily-todo-backup-*.json
+
+# Runtime task data stays local and is never committed
+data/*
+!data/.gitkeep
+!data/README.md

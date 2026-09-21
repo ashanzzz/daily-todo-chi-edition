@@ -1,15 +1,9 @@
 (() => {
   'use strict';
 
-  const TASK_KEY = 'daily-todo.tasks.v1';
-  const PREF_KEY = 'daily-todo.prefs.v1';
   const BACKUP_INTERVAL_DAYS = 30;
   const DEFAULT_PREFS = { theme: 'light', completedOpen: false, lastBackupAt: '', lastSavedAt: '' };
-  const storage = new window.DailyTodoStorage({
-    databaseName: 'daily-todo',
-    legacyTaskKey: TASK_KEY,
-    legacyPrefsKey: PREF_KEY,
-  });
+  const fileSync = new window.DailyTodoFileSync();
   const todayISO = () => toISO(new Date());
   const uid = () => (crypto && crypto.randomUUID) ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
@@ -18,7 +12,11 @@
     prefs: { ...DEFAULT_PREFS },
     ready: false,
     saveState: 'loading',
-    storageMode: 'loading',
+    fileSyncMode: 'checking',
+    requiresLocalServer: false,
+    lastConfirmedSnapshot: null,
+    pendingSnapshot: null,
+    snapshotState: 'healthy',
     saveRevision: 0,
     view: 'today',
     selectedDate: todayISO(),
@@ -38,34 +36,34 @@
     window.addEventListener('load', () => navigator.serviceWorker.register('./sw.js').catch(() => {}));
   }
 
-  window.addEventListener('storage', event => {
-    if (!state.ready || ![TASK_KEY, PREF_KEY].includes(event.key)) return;
-    const legacySnapshot = storage.readLegacy(DEFAULT_PREFS);
-    if (!legacySnapshot) return;
-    state.tasks = legacySnapshot.tasks;
-    state.prefs = legacySnapshot.prefs;
-    state.saveState = 'saved';
-    render();
+  window.addEventListener('beforeunload', event => {
+    if (!state.pendingSnapshot) return;
+    event.preventDefault();
+    event.returnValue = '';
   });
 
   async function bootstrap() {
-    try {
-      const result = await storage.load(DEFAULT_PREFS);
-      state.tasks = result.snapshot.tasks.map(task => ({ ...makeTask({}), ...task, id: task.id || uid() }));
-      state.prefs = { ...DEFAULT_PREFS, ...result.snapshot.prefs };
-      state.storageMode = result.isIndexedDBAvailable ? 'indexeddb' : 'localstorage';
-      state.saveState = 'saved';
-      if (state.prefs.theme === 'dark') document.documentElement.dataset.theme = 'dark';
+    const fileResult = await fileSync.load();
+    if (!fileResult.available) {
       state.ready = true;
-      render();
-      if (state.storageMode === 'indexeddb') void storage.requestPersistentStorage();
-    } catch (error) {
-      console.error('Unable to start Daily Todo storage.', error);
-      state.ready = true;
-      state.storageMode = 'unavailable';
+      state.requiresLocalServer = true;
+      state.fileSyncMode = 'unavailable';
       state.saveState = 'error';
       render();
+      return;
     }
+
+    const snapshot = fileResult.snapshot || { tasks: [], prefs: { ...DEFAULT_PREFS } };
+    state.tasks = snapshot.tasks.map(normalizeTask);
+    state.prefs = { ...DEFAULT_PREFS, ...snapshot.prefs };
+    state.fileSyncMode = 'synced';
+    state.snapshotState = fileResult.snapshotSaved === false ? 'degraded' : 'healthy';
+    state.lastConfirmedSnapshot = cloneSnapshot(snapshot);
+    state.pendingSnapshot = null;
+    state.saveState = 'saved';
+    if (state.prefs.theme === 'dark') document.documentElement.dataset.theme = 'dark';
+    state.ready = true;
+    render();
   }
 
   function persist() {
@@ -73,19 +71,68 @@
     state.prefs.lastSavedAt = new Date().toISOString();
     state.saveState = 'saving';
     const snapshot = { tasks: state.tasks, prefs: state.prefs };
-    void storage.save(snapshot)
-      .then(({ storage: storageMode }) => {
+    state.pendingSnapshot = cloneSnapshot(snapshot);
+
+    void fileSync.save(snapshot)
+      .then(result => {
         if (revision !== state.saveRevision) return;
-        state.storageMode = storageMode;
-        state.saveState = 'saved';
+        state.fileSyncMode = fileSyncStatus(result);
+        updateSnapshotState(result);
+        state.saveState = result.synced ? 'saved' : 'error';
+        if (result.synced) {
+          state.lastConfirmedSnapshot = cloneSnapshot(snapshot);
+          state.pendingSnapshot = null;
+        }
         refreshSaveFeedback();
       })
       .catch(error => {
         if (revision !== state.saveRevision) return;
         console.error('Unable to save Daily Todo data.', error);
+        state.fileSyncMode = 'error';
         state.saveState = 'error';
         refreshSaveFeedback();
       });
+  }
+
+  function cloneSnapshot(snapshot) {
+    return JSON.parse(JSON.stringify(snapshot));
+  }
+
+  function ensureWritable() {
+    if (!state.pendingSnapshot) return true;
+    showToast('数据文件尚未确认保存。请先重试同步或导出备份。');
+    return false;
+  }
+
+  function fileSyncStatus(result) {
+    if (result.conflict) return 'conflict';
+    if (result.synced) return 'synced';
+    if (result.available) return 'error';
+    return 'unavailable';
+  }
+
+  function updateSnapshotState(result) {
+    if (typeof result.snapshotSaved !== 'boolean') return;
+    state.snapshotState = result.snapshotSaved ? 'healthy' : 'degraded';
+  }
+
+  async function retryFileSync() {
+    if (state.fileSyncMode === 'conflict') {
+      showToast('存在同步冲突。请先导出当前待保存数据，再刷新页面。');
+      return;
+    }
+    state.fileSyncMode = 'retrying';
+    render();
+    const result = await fileSync.save({ tasks: state.tasks, prefs: state.prefs });
+    state.fileSyncMode = fileSyncStatus(result);
+    updateSnapshotState(result);
+    state.saveState = result.synced ? 'saved' : 'error';
+    if (result.synced) {
+      state.lastConfirmedSnapshot = cloneSnapshot({ tasks: state.tasks, prefs: state.prefs });
+      state.pendingSnapshot = null;
+    }
+    render();
+    showToast(result.synced ? '项目内数据文件已同步' : '项目内数据文件暂未同步，请稍后重试。');
   }
 
   function refreshSaveFeedback() {
@@ -109,12 +156,13 @@
   }
 
   function saveStatusHTML() {
-    if (state.saveState === 'saving') return '<p class="save-status" data-save-status role="status">正在保存…</p>';
-    if (state.saveState === 'error') return '<p class="save-status is-error" data-save-status role="status">未能保存，请立即导出备份</p>';
+    if (state.saveState === 'saving') return '<p class="save-status" data-save-status role="status">正在写入本地数据文件…</p>';
+    if (state.saveState === 'error') return '<p class="save-status is-error" data-save-status role="status">本地数据文件未保存</p>';
+    if (state.fileSyncMode === 'conflict') return '<p class="save-status is-warning" data-save-status role="status">数据文件存在冲突，请刷新</p>';
     const savedAt = state.prefs.lastSavedAt ? ` · ${formatDateTime(state.prefs.lastSavedAt)}` : '';
-    const label = savedAt ? `已自动保存${savedAt}` : '自动保存已启用';
-    return `<p class="save-status" data-save-status role="status">${icon('check', 15)} ${label}</p>`;
+    return `<p class="save-status" data-save-status role="status">${icon('check', 15)} 本地文件已保存${savedAt}</p>`;
   }
+
   function toISO(d) {
     const year = d.getFullYear();
     const month = String(d.getMonth() + 1).padStart(2, '0');
@@ -225,7 +273,11 @@
 
   function render() {
     if (!state.ready) {
-      app.innerHTML = `<main class="loading-screen" aria-live="polite"><div><span class="brand-mark">D</span><strong>正在打开你的任务</strong><span>正在检查本地数据…</span></div></main>`;
+      app.innerHTML = `<main class="loading-screen" aria-live="polite"><div><span class="brand-mark">D</span><strong>正在连接本地数据文件</strong><span>正在检查程序目录中的数据库…</span></div></main>`;
+      return;
+    }
+    if (state.requiresLocalServer) {
+      app.innerHTML = serverRequiredHTML();
       return;
     }
 
@@ -250,6 +302,10 @@
       ${state.toast ? toastHTML() : ''}
     `;
     bindEvents();
+  }
+
+  function serverRequiredHTML() {
+    return `<main class="server-required-screen"><section class="server-required-card"><span class="brand-mark">D</span><span class="eyebrow">需要本地数据服务</span><h1>请通过启动器打开 Daily Todo</h1><p>为了确保清空浏览器缓存也不会丢失任务，本版本不使用浏览器数据库。所有任务只保存到程序目录的 <code>data/daily-todo-data.json</code>。</p><ol><li>关闭当前页面。</li><li>双击程序目录中的 <strong>start-daily-todo.bat</strong>。</li><li>在自动打开的 <strong>http://localhost:8080</strong> 页面中使用。</li></ol><p class="server-required-note">直接双击 index.html 不会加载或保存任何任务数据。</p></section></main>`;
   }
 
   function sidebarHTML() {
@@ -382,18 +438,18 @@
   }
 
   function taskHTML(task) {
-    return `<div class="task-row ${task.completed ? 'is-complete' : ''}" data-task-row="${task.id}">
-      <button class="check-hit" data-action="toggle-task" data-id="${task.id}" aria-label="${task.completed ? '标记未完成' : '标记完成'}"><span class="check ${task.completed ? 'checked' : ''}">${task.completed ? '✓' : ''}</span></button>
-      <button class="task-main" data-action="edit-task" data-id="${task.id}"><span class="task-title">${escapeHTML(task.title)}</span>${task.notes ? `<span class="task-notes">${escapeHTML(task.notes)}</span>` : ''}</button>
+    return `<div class="task-row ${task.completed ? 'is-complete' : ''}" data-task-row="${escapeHTML(task.id)}">
+      <button class="check-hit" data-action="toggle-task" data-id="${escapeHTML(task.id)}" aria-label="${task.completed ? '标记未完成' : '标记完成'}"><span class="check ${task.completed ? 'checked' : ''}">${task.completed ? '✓' : ''}</span></button>
+      <button class="task-main" data-action="edit-task" data-id="${escapeHTML(task.id)}"><span class="task-title">${escapeHTML(task.title)}</span>${task.notes ? `<span class="task-notes">${escapeHTML(task.notes)}</span>` : ''}</button>
       <div class="task-meta">
         ${task.time ? `<span class="time">${icon('clock',14)}${escapeHTML(task.time)}</span>` : ''}
-        <button class="icon-button subtle ${task.important ? 'active' : ''}" data-action="important-task" data-id="${task.id}" aria-label="重要">${icon('star',17)}</button>
+        <button class="icon-button subtle ${task.important ? 'active' : ''}" data-action="important-task" data-id="${escapeHTML(task.id)}" aria-label="重要">${icon('star',17)}</button>
         <div class="task-menu-wrap">
           <button class="icon-button subtle menu-trigger" aria-label="更多">${icon('more')}</button>
           <div class="task-menu">
-            <button data-action="edit-task" data-id="${task.id}">编辑</button>
-            <button data-action="tomorrow-task" data-id="${task.id}">移到明天</button>
-            <button class="danger" data-action="delete-task" data-id="${task.id}">删除</button>
+            <button data-action="edit-task" data-id="${escapeHTML(task.id)}">编辑</button>
+            <button data-action="tomorrow-task" data-id="${escapeHTML(task.id)}">移到明天</button>
+            <button class="danger" data-action="delete-task" data-id="${escapeHTML(task.id)}">删除</button>
           </div>
         </div>
       </div>
@@ -461,28 +517,33 @@
 
   function settingsHTML() {
     const dark = state.prefs.theme === 'dark';
-    const backupText = state.prefs.lastBackupAt ? `上次备份：${formatDateTime(state.prefs.lastBackupAt)}` : '建议定期下载 JSON 备份';
-    const isIndexedDB = state.storageMode === 'indexeddb';
-    const storageText = state.saveState === 'error'
-      ? '未能写入 IndexedDB，请立即导出备份。'
-      : isIndexedDB
-        ? `已保存到 IndexedDB${state.prefs.lastSavedAt ? ` · ${formatDateTime(state.prefs.lastSavedAt)}` : ''}`
-        : '当前浏览器不支持 IndexedDB，正在使用兼容保存。';
-    const launchNote = location.protocol === 'file:'
-      ? '建议通过 localhost 或静态网站打开：这会提供更稳定的浏览器存储和 PWA 离线能力。'
-      : '数据会同步写入 IndexedDB 和兼容副本；清除浏览器站点数据仍会删除本地任务。';
+    const isFileSynced = state.fileSyncMode === 'synced';
+    const fileConflict = state.fileSyncMode === 'conflict';
+    const fileError = state.fileSyncMode === 'error';
+    const snapshotDegraded = state.snapshotState === 'degraded';
+    const backupText = state.prefs.lastBackupAt ? `上次导出：${formatDateTime(state.prefs.lastBackupAt)}` : '建议定期下载 JSON 备份';
+    const fileText = isFileSynced
+      ? `当前数据库：data/daily-todo-data.json${state.prefs.lastSavedAt ? ` · ${formatDateTime(state.prefs.lastSavedAt)}` : ''}`
+      : fileConflict
+        ? '检测到其他标签已更新数据文件。当前待保存改动仍在本页面内，请先导出后再刷新。'
+        : fileError
+          ? '数据文件暂未写入。当前改动仍留在本页面内；请先重试或导出，再关闭或刷新。'
+          : '本地数据服务不可用。请检查 start-daily-todo.bat 是否仍在运行。';
+    const fileBadge = isFileSynced ? '已同步' : fileConflict ? '需刷新' : fileError ? '需重试' : '服务离线';
+    const fileAction = fileError ? '<button class="button secondary" data-action="retry-file-sync">重试同步</button>' : '<span class="storage-badge ' + (isFileSynced ? '' : 'is-error') + '">' + fileBadge + '</span>';
     return `<section class="page settings-page">
-      ${headingHTML('偏好', '设置', '本地优先保存，不依赖网络。')}
+      ${headingHTML('偏好', '设置', '所有任务仅写入程序目录的数据文件。')}
       <div class="settings-card">
-        <div class="setting-row"><div><strong>自动保存</strong><span>${storageText}</span></div><span class="storage-badge ${state.saveState === 'error' ? 'is-error' : ''}">${state.saveState === 'error' ? '需备份' : isIndexedDB ? 'IndexedDB' : '兼容模式'}</span></div>
+        <div class="setting-row"><div><strong>本地数据库文件</strong><span>${fileText}</span></div>${fileAction}</div>
+        <div class="setting-row"><div><strong>每日恢复快照</strong><span>${snapshotDegraded ? '当前数据库已保存，但今日恢复快照未能生成；下次保存会自动重试。' : 'data/backups/ 中保留当天及之前 89 个日历日'}</span></div><span class="storage-badge ${snapshotDegraded ? 'is-error' : ''}">${snapshotDegraded ? '需修复' : '90 天'}</span></div>
         <div class="setting-row"><div><strong>外观</strong><span>切换浅色和深色模式</span></div><button class="button secondary" data-action="toggle-theme">${icon(dark ? 'sun' : 'moon', 16)} ${dark ? '浅色' : '深色'}</button></div>
         <div class="setting-row"><div><strong>导出备份</strong><span>${backupText}</span></div><button class="button secondary" data-action="export-data">${icon('download', 16)} 立即备份</button></div>
         <div class="setting-row"><div><strong>导入数据</strong><span>从之前导出的 JSON 恢复</span></div><button class="button secondary" data-action="import-data">${icon('upload', 16)} 导入</button></div>
-        <div class="setting-row warning-row"><div><strong>清空数据</strong><span>删除当前浏览器中的所有任务</span></div><button class="button danger-button" data-action="clear-data">${icon('trash', 16)} 清空</button></div>
+        <div class="setting-row warning-row"><div><strong>清空数据</strong><span>清空程序目录中的当前数据文件和本页面任务</span></div><button class="button danger-button" data-action="clear-data">${icon('trash', 16)} 清空</button></div>
         <input id="import-file" type="file" accept="application/json" hidden />
       </div>
-      ${isBackupDue() ? '<div class="backup-reminder"><strong>建议现在备份一次</strong><span>本地数据不会随浏览器、设备或同步盘自动迁移。导出的 JSON 文件可用于恢复。</span></div>' : ''}
-      <div class="settings-note">${launchNote}</div>
+      ${isBackupDue() ? '<div class="backup-reminder"><strong>建议额外导出一次</strong><span>项目内文件保护本机数据；JSON 导出适合复制到另一台设备或异地保存。</span></div>' : ''}
+      <div class="settings-note">浏览器缓存只包含界面资源。清空浏览器缓存不会删除 data/ 文件夹中的任务数据。</div>
     </section>`;
   }
   function sortByDate(items) { return [...items].sort((a,b) => a.date.localeCompare(b.date)); }
@@ -500,8 +561,8 @@
         <form class="task-form" id="task-form">
           <label><span>任务名称</span><input id="field-title" autocomplete="off" autofocus value="${escapeHTML(task?.title || '')}" placeholder="例如：完成英语作业" /></label>
           <div class="form-grid">
-            <label><span>日期</span><input id="field-date" type="date" value="${task?.date || state.selectedDate}" /></label>
-            <label><span>时间</span><input id="field-time" type="time" value="${task?.time || ''}" /></label>
+            <label><span>日期</span><input id="field-date" type="date" value="${escapeHTML(task?.date || state.selectedDate)}" /></label>
+            <label><span>时间</span><input id="field-time" type="time" value="${escapeHTML(task?.time || '')}" /></label>
           </div>
           <label><span>重复</span><select id="field-repeat"><option value="none">不重复</option><option value="daily">每天</option><option value="weekdays">工作日</option><option value="weekly">每周</option></select></label>
           <label><span>备注</span><textarea id="field-notes" rows="5" placeholder="可选备注">${escapeHTML(task?.notes || '')}</textarea></label>
@@ -515,11 +576,11 @@
   function searchHTML() {
     const q = state.searchText.trim().toLowerCase();
     const results = q ? state.tasks.filter(t => t.title.toLowerCase().includes(q) || String(t.notes || '').toLowerCase().includes(q)).slice(0, 14) : [];
-    return `<div class="search-layer" data-layer="search"><div class="search-panel"><div class="search-input">${icon('search')}<input id="search-box" autocomplete="off" placeholder="搜索任务" value="${escapeHTML(state.searchText)}"/><button class="icon-button" data-action="close-search">${icon('close',17)}</button></div><div class="search-results">${q ? (results.length ? results.map(t => `<button data-action="search-open-task" data-id="${t.id}"><span><strong>${escapeHTML(t.title)}</strong><small>${niceDate(t.date, true)}</small></span><em>${t.completed ? '已完成' : '待完成'}</em></button>`).join('') : '<div class="search-hint">没有找到匹配任务</div>') : '<div class="search-hint">输入任务名称或备注开始搜索</div>'}</div></div></div>`;
+    return `<div class="search-layer" data-layer="search"><div class="search-panel"><div class="search-input">${icon('search')}<input id="search-box" autocomplete="off" placeholder="搜索任务" value="${escapeHTML(state.searchText)}"/><button class="icon-button" data-action="close-search">${icon('close',17)}</button></div><div class="search-results">${q ? (results.length ? results.map(t => `<button data-action="search-open-task" data-id="${escapeHTML(t.id)}"><span><strong>${escapeHTML(t.title)}</strong><small>${niceDate(t.date, true)}</small></span><em>${t.completed ? '已完成' : '待完成'}</em></button>`).join('') : '<div class="search-hint">没有找到匹配任务</div>') : '<div class="search-hint">输入任务名称或备注开始搜索</div>'}</div></div></div>`;
   }
 
   function toastHTML() {
-    return `<div class="toast"><span>${escapeHTML(state.toast.text)}</span>${state.toast.undoId ? `<button data-action="undo-complete" data-id="${state.toast.undoId}">撤销</button>` : ''}</div>`;
+    return `<div class="toast"><span>${escapeHTML(state.toast.text)}</span>${state.toast.undoId ? `<button data-action="undo-complete" data-id="${escapeHTML(state.toast.undoId)}">撤销</button>` : ''}</div>`;
   }
 
   function bindEvents() {
@@ -583,6 +644,7 @@
     if (quick) quick.addEventListener('submit', e => {
       e.preventDefault();
       const input = document.getElementById('quick-title');
+      if (!ensureWritable()) return;
       const title = input.value.trim();
       if (!title) return;
       state.tasks.push(makeTask({ title, date: state.selectedDate }));
@@ -597,6 +659,7 @@
       if (repeat && task) repeat.value = task.repeat || 'none';
       taskForm.addEventListener('submit', e => {
         e.preventDefault();
+        if (!ensureWritable()) return;
         const title = document.getElementById('field-title').value.trim();
         if (!title) { document.getElementById('field-title').focus(); return; }
         const data = {
@@ -628,7 +691,7 @@
         const parsed = JSON.parse(await file.text());
         const importedTasks = Array.isArray(parsed) ? parsed : parsed?.tasks;
         if (!Array.isArray(importedTasks)) throw new Error('bad format');
-        state.tasks = importedTasks.map(t => ({ ...makeTask({}), ...t, id: t.id || uid() }));
+        state.tasks = importedTasks.map(normalizeTask);
         persist();
         showToast(`已导入 ${state.tasks.length} 条任务`);
       } catch {
@@ -671,7 +734,38 @@
     };
   }
 
+  function normalizeTask(value) {
+    const source = value && typeof value === 'object' ? value : {};
+    const task = makeTask({});
+    const safeText = input => typeof input === 'string' ? input.slice(0, 20000) : '';
+    const validDate = input => typeof input === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(input) && !Number.isNaN(fromISO(input).getTime());
+    const validTime = input => typeof input === 'string' && /^([01]\d|2[0-3]):[0-5]\d$/.test(input);
+    const validId = input => typeof input === 'string' && /^[A-Za-z0-9_-]{1,200}$/.test(input);
+    const validRepeat = ['none', 'daily', 'weekdays', 'weekly'].includes(source.repeat) ? source.repeat : 'none';
+    const validStamp = input => typeof input === 'string' && !Number.isNaN(new Date(input).getTime()) ? input : task.createdAt;
+
+    return {
+      ...task,
+      id: validId(source.id) ? source.id : uid(),
+      title: safeText(source.title).slice(0, 2000),
+      date: validDate(source.date) ? source.date : todayISO(),
+      time: validTime(source.time) ? source.time : '',
+      notes: safeText(source.notes),
+      important: source.important === true,
+      completed: source.completed === true,
+      completedAt: source.completed === true ? validStamp(source.completedAt) : '',
+      repeat: validRepeat,
+      createdAt: validStamp(source.createdAt),
+      updatedAt: validStamp(source.updatedAt),
+    };
+  }
+
   function handleAction(action, id) {
+    const nonMutatingActions = new Set(['week-prev', 'week-next', 'week-today', 'open-search', 'close-search', 'close-drawer', 'retry-file-sync', 'export-data']);
+    if (state.pendingSnapshot && !nonMutatingActions.has(action)) {
+      showToast('数据文件尚未确认保存。请先重试同步或导出备份。');
+      return;
+    }
     if (action === 'week-prev') {
       state.selectedDate = addDays(state.selectedDate, -7);
       render();
@@ -713,6 +807,7 @@
       document.documentElement.dataset.theme = state.prefs.theme === 'dark' ? 'dark' : 'light';
       persist(); return render();
     }
+    if (action === 'retry-file-sync') return retryFileSync();
     if (action === 'export-data') return exportData();
     if (action === 'import-data') return document.getElementById('import-file')?.click();
     if (action === 'clear-data') {
@@ -782,8 +877,10 @@
       exportedAt,
       tasks: state.tasks,
     };
-    state.prefs.lastBackupAt = exportedAt;
-    persist();
+    if (!state.pendingSnapshot) {
+      state.prefs.lastBackupAt = exportedAt;
+      persist();
+    }
     const blob = new Blob([JSON.stringify(backup, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
