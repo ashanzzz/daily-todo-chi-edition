@@ -1,0 +1,17 @@
+{
+  "name": "daily-todo-chi-edition",
+  "version": "1.0.0",
+  "description": "Daily Todo (Executive Edition for President Chi) - Lightweight, local-first todo app with file-based persistence, stepper week strip & calendar",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "keywords": [
+    "todo",
+    "productivity",
+    "local-first",
+    "offline-first"
+  ],
+  "author": "Meng",
+  "license": "MIT"
+}
